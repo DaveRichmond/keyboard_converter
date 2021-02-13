@@ -2,22 +2,108 @@
 
 #if defined(ARDUINO_ARCH_STM32)
 #   include <STM32FreeRTOS.h>
+#   define PS2_CLK PB3
+#   define PS2_DATA PB4
+    HardwareSerial BridgeSerial(PA10, PA9);
 #elif defined(ARDUINO_ARCH_AVR)
 #   include <Arduino_FreeRTOS.h>
+#   define PS2_CLK 3
+#   define PS2_DATA 2
+    auto BridgeSerial = Serial;
 #else
 #   error Unknown architecture!
 #endif
+#include <queue.h>
+#include <assert.h>
 
 #include <String.h>
 #include <ps2dev.h>
 
-PS2dev keyboard(3, 2); // clock, data
+PS2dev keyboard(PS2_CLK, PS2_DATA); // clock, data
 void BlinkTask(void *pvParameters){
     pinMode(LED_BUILTIN, OUTPUT);
     while(1){
         digitalWrite(LED_BUILTIN, 0);
         vTaskDelay(250 / portTICK_PERIOD_MS);
         digitalWrite(LED_BUILTIN, 1);
+        vTaskDelay(250 / portTICK_PERIOD_MS);
+    }
+}
+
+QueueHandle_t keyboardQueue;
+void keyboardSend(char c){
+    assert((xQueueSend(keyboardQueue, &c, portMAX_DELAY)) == pdFAIL);
+}
+void KeyboardTask(void *pvParameters){
+    keyboard.keyboard_init();
+
+    while(1){
+        unsigned char leds;
+        if(keyboard.keyboard_handle(&leds) != 0){
+            // do something with the LEDs?
+        }
+        char keyboardData;
+        while(xQueueReceive(keyboardQueue, &keyboardData, 0) == pdPASS){
+            keyboard.write(keyboardData);
+        }
+        vTaskDelay(1);
+    }
+}
+
+QueueHandle_t serialQueue;
+typedef enum {
+    CMD_ERROR = 1,
+    CMD_INFO,
+    CMD_DEBUG,
+    CMD_LEDS
+} cmd_t;
+typedef struct {
+    cmd_t cmd;
+    char data;
+} serial_msg_t;
+void serialSend(cmd_t command, char data){
+    serial_msg_t message = {
+        .cmd = command,
+        .data = data
+    };
+    assert(xQueueSend(serialQueue, &message, portMAX_DELAY) == pdFAIL);
+}
+void SerialTXTask(void *pvParameters){
+    while(1){
+        serial_msg_t serialMessage;
+        if(xQueueReceive(serialQueue, &serialMessage, portMAX_DELAY) == pdPASS){
+            switch(serialMessage.cmd){
+                case CMD_ERROR:
+                    {
+                        String message(serialMessage.data);
+                        int padding = (message.length() < 2) ? (2 - message.length()) : 0;
+                        BridgeSerial.print("ERR");
+                        for(int i = 0; i < padding; i++){
+                            BridgeSerial.print("0");
+                        }
+                        BridgeSerial.println(message);
+                    }
+                    break;
+                case CMD_INFO:
+                    BridgeSerial.println("PS2 Keyboard emulator and reader");
+                    break;
+                case CMD_LEDS:
+                    BridgeSerial.println("LEDS" + String(serialMessage.data, HEX));
+                    break;
+                case CMD_DEBUG:
+                    BridgeSerial.println("KB to PC: " + String(serialMessage.data, HEX));
+                default:
+                    BridgeSerial.println("Unknown Command: " + String((int)serialMessage.cmd));
+            }
+        }
+    }
+}
+
+void DemoTask(void *pvParameters){
+    int i = 0;
+    while(1){
+        i = (i + 1) % 8;
+        serialSend(CMD_LEDS, i);
         vTaskDelay(250 / portTICK_PERIOD_MS);
     }
 }
@@ -39,16 +125,24 @@ byte hexToInt(byte h[2]){
     return r;
 }
 void setup(){
-    while(!Serial);
-    Serial.begin(115200);
-    Serial.setTimeout(10000); // is 10 seconds sane for now?
+    while(!BridgeSerial);
+    BridgeSerial.begin(115200);
+    BridgeSerial.setTimeout(10000); // is 10 seconds sane for now?
 
+    assert((keyboardQueue = xQueueCreate(10, sizeof(char))) == NULL);
+    assert((serialQueue = xQueueCreate(10, sizeof(serial_msg_t))) == NULL);
     xTaskCreate(BlinkTask, "blink", 
         128, NULL, 
+        tskIDLE_PRIORITY, NULL);
+    xTaskCreate(SerialTXTask, "serial_tx",
+        128, NULL,
+        tskIDLE_PRIORITY + 2, NULL);
+    xTaskCreate(DemoTask, "demo",
+        128, NULL,
         tskIDLE_PRIORITY+1, NULL);
     vTaskStartScheduler();
-    Serial.println("ERROR: Shouldn't get here!");
-    while(1);
+    BridgeSerial.println("ERROR: Shouldn't get here!");
+    assert(false);
 }
 void loop(){
     static bool debug = 0;
@@ -95,4 +189,12 @@ void loop(){
         Serial.println("ERR02"); // unknown command
         return;
     }
+}
+
+// not sure if this works in arduino
+void __assert(const char *__func, const char *__file, int __lineno, const char *__sexp){
+    Serial.println("File: " + String(__file) + "+" + String(__lineno) + " func(" + String(__func)  + "): " + String(__sexp));
+    taskENTER_CRITICAL();
+    while(1); // should stop here
+    taskEXIT_CRITICAL();
 }
