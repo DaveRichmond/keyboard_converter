@@ -1,10 +1,12 @@
 #include <Arduino.h>
 
+// configuration
 #if defined(ARDUINO_ARCH_STM32)
 #   include <STM32FreeRTOS.h>
 #   define PS2_CLK PB3
 #   define PS2_DATA PB4
-    HardwareSerial BridgeSerial(PA10, PA9);
+    //HardwareSerial BridgeSerial(PA10, PA9);
+    auto BridgeSerial = Serial;
 #elif defined(ARDUINO_ARCH_AVR)
 #   include <Arduino_FreeRTOS.h>
 #   define PS2_CLK 3
@@ -19,6 +21,19 @@
 #include <String.h>
 #include <ps2dev.h>
 
+typedef enum {
+    CMD_ERROR = 1,
+    CMD_INFO,
+    CMD_DEBUG,
+    CMD_LEDS
+} cmd_t;
+typedef struct {
+    cmd_t cmd;
+    char data;
+} serial_msg_t;
+void serialSend(cmd_t cmd, char data);
+void keyboardSend(char c);
+
 PS2dev keyboard(PS2_CLK, PS2_DATA); // clock, data
 void BlinkTask(void *pvParameters){
     pinMode(LED_BUILTIN, OUTPUT);
@@ -32,7 +47,7 @@ void BlinkTask(void *pvParameters){
 
 QueueHandle_t keyboardQueue;
 void keyboardSend(char c){
-    assert((xQueueSend(keyboardQueue, &c, portMAX_DELAY)) == pdFAIL);
+    assert((xQueueSend(keyboardQueue, &c, portMAX_DELAY)) != pdFAIL);
 }
 void KeyboardTask(void *pvParameters){
     keyboard.keyboard_init();
@@ -40,7 +55,7 @@ void KeyboardTask(void *pvParameters){
     while(1){
         unsigned char leds;
         if(keyboard.keyboard_handle(&leds) != 0){
-            // do something with the LEDs?
+            serialSend(CMD_LEDS, leds);
         }
         char keyboardData;
         while(xQueueReceive(keyboardQueue, &keyboardData, 0) == pdPASS){
@@ -51,22 +66,12 @@ void KeyboardTask(void *pvParameters){
 }
 
 QueueHandle_t serialQueue;
-typedef enum {
-    CMD_ERROR = 1,
-    CMD_INFO,
-    CMD_DEBUG,
-    CMD_LEDS
-} cmd_t;
-typedef struct {
-    cmd_t cmd;
-    char data;
-} serial_msg_t;
 void serialSend(cmd_t command, char data){
     serial_msg_t message = {
         .cmd = command,
         .data = data
     };
-    assert(xQueueSend(serialQueue, &message, portMAX_DELAY) == pdFAIL);
+    assert(xQueueSend(serialQueue, &message, portMAX_DELAY) != pdFAIL);
 }
 void SerialTXTask(void *pvParameters){
     while(1){
@@ -96,15 +101,34 @@ void SerialTXTask(void *pvParameters){
                     BridgeSerial.println("Unknown Command: " + String((int)serialMessage.cmd));
             }
         }
+
+        //if(xTaskGetTickCount() > next){
+        //    char buf[200];
+        //    vTaskGetRunTimeStats((char *)&buf);
+        //    BridgeSerial.println(buf);
+        //    next = next + (1000 / portTICK_PERIOD_MS);
+        //}
     }
 }
 
+// For bringing up the project, and to ensure the basic serial IO is working
+// we'll make a task that periodically fires off an LED update
 void DemoTask(void *pvParameters){
     int i = 0;
     while(1){
         i = (i + 1) % 8;
         serialSend(CMD_LEDS, i);
-        vTaskDelay(250 / portTICK_PERIOD_MS);
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+}
+
+// Stuff the arduino environment needs to do in order to keep running
+// for stm32 at least the serialEvents need to be run often, so let's just run this at a very high priority
+// for now. Mostly it's just handling the serial FIFOs.
+void ArduinoTask(void *pvParameters){
+    while(1){
+        if(serialEventRun) serialEventRun();
+        vTaskDelay(1);
     }
 }
 
@@ -128,14 +152,18 @@ void setup(){
     while(!BridgeSerial);
     BridgeSerial.begin(115200);
     BridgeSerial.setTimeout(10000); // is 10 seconds sane for now?
+    BridgeSerial.println("Initialising");
 
-    assert((keyboardQueue = xQueueCreate(10, sizeof(char))) == NULL);
-    assert((serialQueue = xQueueCreate(10, sizeof(serial_msg_t))) == NULL);
+    assert((keyboardQueue = xQueueCreate(10, sizeof(char))) != NULL);
+    assert((serialQueue = xQueueCreate(10, sizeof(serial_msg_t))) != NULL);
+    xTaskCreate(ArduinoTask, "arduino_services",
+        128, NULL,
+        tskIDLE_PRIORITY+10, NULL);
     xTaskCreate(BlinkTask, "blink", 
         128, NULL, 
         tskIDLE_PRIORITY, NULL);
     xTaskCreate(SerialTXTask, "serial_tx",
-        128, NULL,
+        512, NULL,
         tskIDLE_PRIORITY + 2, NULL);
     xTaskCreate(DemoTask, "demo",
         128, NULL,
