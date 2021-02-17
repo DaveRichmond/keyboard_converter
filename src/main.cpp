@@ -20,11 +20,13 @@
 
 #include <String.h>
 #include <ps2dev.h>
+#include <LedController.hpp>
 
 typedef enum {
     CMD_ERROR = 1,
     CMD_INFO,
     CMD_DEBUG,
+    CMD_OK,
     CMD_LEDS
 } cmd_t;
 typedef struct {
@@ -33,6 +35,7 @@ typedef struct {
 } serial_msg_t;
 void serialSend(cmd_t cmd, char data);
 void keyboardSend(char c);
+void debugSend(char c);
 
 PS2dev keyboard(PS2_CLK, PS2_DATA); // clock, data
 void BlinkTask(void *pvParameters){
@@ -45,6 +48,9 @@ void BlinkTask(void *pvParameters){
     }
 }
 
+void serialService(){
+    serialEventRun();
+}
 QueueHandle_t keyboardQueue;
 void keyboardSend(char c){
     assert((xQueueSend(keyboardQueue, &c, portMAX_DELAY)) != pdFAIL);
@@ -61,7 +67,7 @@ void KeyboardTask(void *pvParameters){
         while(xQueueReceive(keyboardQueue, &keyboardData, 0) == pdPASS){
             keyboard.write(keyboardData);
         }
-        vTaskDelay(1);
+        vTaskDelay(10/portTICK_PERIOD_MS);
     }
 }
 
@@ -76,11 +82,11 @@ void serialSend(cmd_t command, char data){
 void SerialTXTask(void *pvParameters){
     while(1){
         serial_msg_t serialMessage;
-        if(xQueueReceive(serialQueue, &serialMessage, portMAX_DELAY) == pdPASS){
+        if(xQueueReceive(serialQueue, &serialMessage, 0) == pdPASS){
             switch(serialMessage.cmd){
                 case CMD_ERROR:
                     {
-                        String message(serialMessage.data);
+                        String message((int)serialMessage.data);
                         int padding = (message.length() < 2) ? (2 - message.length()) : 0;
                         BridgeSerial.print("ERR");
                         for(int i = 0; i < padding; i++){
@@ -93,14 +99,23 @@ void SerialTXTask(void *pvParameters){
                     BridgeSerial.println("PS2 Keyboard emulator and reader");
                     break;
                 case CMD_LEDS:
-                    BridgeSerial.println("LEDS" + String(serialMessage.data, HEX));
+                    BridgeSerial.println("LEDS" + String((int)serialMessage.data, HEX));
                     break;
                 case CMD_DEBUG:
-                    BridgeSerial.println("KB to PC: " + String(serialMessage.data, HEX));
+                    BridgeSerial.println("KB to PC: " + String((int)serialMessage.data, HEX));
+                    break;
+                case CMD_OK:
+                    //BridgeSerial.println("OK" + String((int)serialMessage.data, DEC));
+                    BridgeSerial.println("OK");
+                    break;
                 default:
                     BridgeSerial.println("Unknown Command: " + String((int)serialMessage.cmd));
+                    break;
             }
+            BridgeSerial.flush();
         }
+        serialService();
+        vTaskDelay(1);
 
         //if(xTaskGetTickCount() > next){
         //    char buf[200];
@@ -108,6 +123,93 @@ void SerialTXTask(void *pvParameters){
         //    BridgeSerial.println(buf);
         //    next = next + (1000 / portTICK_PERIOD_MS);
         //}
+    }
+}
+
+int hexToInt(char c){
+    if(c >= '0' && c <= '9'){
+        return c - '0';
+    }
+    if(c >= 'A' && c <= 'F'){
+        return 10 + (c - 'A');
+    }
+    if(c >= 'a' && c <= 'f'){
+        return 10 + (c - 'a');
+    }
+    return 0;
+}
+int keyboardHexParse(String &s, bool debug){
+        if((s.length() % 2) != 0){
+            serialSend(CMD_ERROR, 3); // uneven number of arguments
+            return 0;
+        }
+        if(s.length() > 30){
+            serialSend(CMD_ERROR, 1); // too many keys
+            return 0;
+        }   
+        for(int i = 0; i < s.length(); i++){
+            if(!isHexadecimalDigit(s[0])){
+                serialSend(CMD_ERROR, 4); // invalid character
+                return 0;
+            }
+        }
+        
+        int sent = 0;
+        for(int i = 0; i < s.length(); i += 2){
+            char a = hexToInt(s[i]);
+            char b = hexToInt(s[i+1]);
+            char c = (a << 4) | b;
+            //BridgeSerial.println("a:" + String((int)a, HEX) + " b:" + String((int)b, HEX) + " c:" + String((int)c, HEX));
+            if(debug){
+                serialSend(CMD_DEBUG, c);
+            }
+            debugSend(c);
+            keyboardSend(c);
+            sent++;
+        }
+        return sent;
+}
+String readLine(char terminator){
+    String line;
+    char c = NULL;
+    int length = 0;
+
+    do {
+        while(BridgeSerial.available()){
+            c = BridgeSerial.read();
+            line += String((char)c);
+            length++;
+            if(length >= 34){
+                serialSend(CMD_ERROR, 1);
+                return String("NULL");
+            }
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    } while(c != terminator);
+    return line;
+}
+void SerialRXTask(void *pvParameters){
+    bool debug = false;
+    while(1){
+        //String line = BridgeSerial.readStringUntil('\n'); // this is very CPU heavy and needs some vTaskDelays to not just sit there chewing the whole cpu up with nothing happening
+        String line = readLine('\n');
+        line.trim(); // remove excess whitespace
+        if(line.length() > 0){
+            //BridgeSerial.println(String("Line: ") + line);
+            if(line.startsWith("IDN")){
+                serialSend(CMD_INFO, 0);
+            } else if(line.startsWith("RDA0")){
+                debug = false;
+            } else if(line.startsWith("RDA1")){
+                debug = true;
+            } else if(line.startsWith("SPC:")){
+                line = line.substring(line.indexOf(":")+1); // give me everything after the ":"
+                int sent = keyboardHexParse(line, debug);
+                serialSend(CMD_OK, sent);
+            } else {
+                serialSend(CMD_ERROR, 2); // unknown command!
+            }
+        }
     }
 }
 
@@ -132,6 +234,43 @@ void ArduinoTask(void *pvParameters){
     }
 }
 
+
+QueueHandle_t debugQueue = NULL; 
+void debugSend(char msg){
+    xQueueSend(debugQueue, (void *)&msg, 0); // don't care if this fails
+}
+char toHex(int i){
+    String s = String(i, HEX);
+    return s.c_str()[0];
+}
+void DebugTask(void *pvParameters){
+    LedController led(
+        PB0, // Data
+        PC0, // Clk
+        PC1, // Load/CS
+        1 // Number of MAX7219 Devices
+    );
+    led.activateAllSegments();
+    led.setIntensity(8);
+    led.clearMatrix();
+    while(1){
+        int msg;
+        if(xQueueReceive(debugQueue, &msg, portMAX_DELAY) == pdPASS){            
+            led.setChar(0, 1, toHex((msg >> 4) & 0x0F), false); // indexed to the right of the display
+            led.setChar(0, 0, toHex(msg & 0x0F), false);
+        }
+    }
+}
+
+void StatsTask(void *pvParameters){
+    char buf[200];
+    while(1){
+        //vTaskList((char *)&buf);
+        //Serial.println(buf);
+        vTaskDelay(1000 * portTICK_RATE_MS);
+    }
+}
+
 byte hexToInt(byte h[2]){
     signed int r = 0;
     for(int i = 0; i < 2; i++){
@@ -151,72 +290,45 @@ byte hexToInt(byte h[2]){
 void setup(){
     while(!BridgeSerial);
     BridgeSerial.begin(115200);
-    BridgeSerial.setTimeout(10000); // is 10 seconds sane for now?
+    //BridgeSerial.setTimeout(10000); // is 10 seconds sane for now?
     BridgeSerial.println("Initialising");
 
-    assert((keyboardQueue = xQueueCreate(10, sizeof(char))) != NULL);
+    assert((keyboardQueue = xQueueCreate(32, sizeof(char))) != NULL);
     assert((serialQueue = xQueueCreate(10, sizeof(serial_msg_t))) != NULL);
-    xTaskCreate(ArduinoTask, "arduino_services",
-        128, NULL,
-        tskIDLE_PRIORITY+10, NULL);
+    assert((debugQueue  = xQueueCreate(16, sizeof(char))) != NULL);
+    //xTaskCreate(ArduinoTask, "arduino_services",
+    //    1024, NULL,
+    //    tskIDLE_PRIORITY+6, NULL);
     xTaskCreate(BlinkTask, "blink", 
         128, NULL, 
         tskIDLE_PRIORITY, NULL);
     xTaskCreate(SerialTXTask, "serial_tx",
-        512, NULL,
-        tskIDLE_PRIORITY + 2, NULL);
-    xTaskCreate(DemoTask, "demo",
-        128, NULL,
+        1024, NULL,
+        tskIDLE_PRIORITY+2, NULL);
+    xTaskCreate(SerialRXTask, "serial_rx",
+        1024, NULL,
         tskIDLE_PRIORITY+1, NULL);
+    //xTaskCreate(KeyboardTask, "keyboard",
+    //    1024, NULL,
+    //    tskIDLE_PRIORITY, NULL);
+    xTaskCreate(DebugTask, "debug_output", 
+        1024, NULL,
+        tskIDLE_PRIORITY+1, NULL);
+    //xTaskCreate(StatsTask, "stats",
+    //    512, NULL,
+    //    tskIDLE_PRIORITY+2, NULL);
+    //xTaskCreate(DemoTask, "demo",
+    //    256, NULL,
+    //    tskIDLE_PRIORITY+1, NULL);
     vTaskStartScheduler();
     BridgeSerial.println("ERROR: Shouldn't get here!");
     assert(false);
 }
 void loop(){
-    static bool debug = 0;
-    String s = Serial.readStringUntil('\n');
-
-    if(s.startsWith("IDN")){
-        Serial.println("PS2 Keyboard emulator and reader");
-    } else if(s.startsWith("RDA0")){
-        debug = 0;
-    } else if(s.startsWith("RDA1")){
-        debug = 1;
-    } else if(s.startsWith("SPC:")){
-        s.remove(0, 4); // remove the command
-        if(s.length() > 30){
-            Serial.println("ERR01"); // maximum command length exceeded
-            return;
-        }
-        if((s.length() % 2) != 0){
-            Serial.println("ERR03"); // command length not even
-            return;
-        }
-        for(unsigned int i = 0; i < s.length(); i++){
-            if(! ((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f') || (s[i] >= 'A' && s[i] <= 'F'))){
-                Serial.println("ERR04"); // invalid hex characters
-                return;
-            }
-        }
-        while(s.length()){
-            byte h[2];
-            s.getBytes((unsigned char *)&h, 2);
-            signed int c = hexToInt(h);
-            if(c == -1){
-                Serial.println("ERR05"); // invalid characters, but somehow got past sanity check before??? HOW!
-                return;
-            }
-            keyboard.write((byte)c);
-            if(debug){
-                Serial.println(String("KB to PC: ") + String(c, HEX));
-            }
-            s.remove(0, 2); // remove the bytes we just requested
-        }
-        Serial.println("OK");
-    } else {
-        Serial.println("ERR02"); // unknown command
-        return;
-    }
+    static int idle = 0;
+    // Shouldn't get here!
+    //assert(false);
+    idle++;
 }
 
 // not sure if this works in arduino
