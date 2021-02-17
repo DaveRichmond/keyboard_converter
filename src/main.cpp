@@ -144,18 +144,19 @@ int keyboardHexParse(String &s, bool debug){
             return 0;
         }
         if(s.length() > 30){
-            serialSend(CMD_ERROR, 1); // too many keys
+            serialSend(CMD_ERROR, 1); // too many keys, the input loop checks this too so we probably shouldn't hit this one. Doesn't hurt to check again
             return 0;
         }   
-        for(int i = 0; i < s.length(); i++){
+        for(signed int i = 0; i < s.length(); i++){
             if(!isHexadecimalDigit(s[0])){
                 serialSend(CMD_ERROR, 4); // invalid character
                 return 0;
             }
         }
         
+        // now we've sanity checked our input, send it through the queue
         int sent = 0;
-        for(int i = 0; i < s.length(); i += 2){
+        for(signed int i = 0; i < s.length(); i += 2){
             char a = hexToInt(s[i]);
             char b = hexToInt(s[i+1]);
             char c = (a << 4) | b;
@@ -171,7 +172,7 @@ int keyboardHexParse(String &s, bool debug){
 }
 String readLine(char terminator){
     String line;
-    char c = NULL;
+    char c = (char)NULL;
     int length = 0;
 
     do {
@@ -196,7 +197,9 @@ void SerialRXTask(void *pvParameters){
         line.trim(); // remove excess whitespace
         if(line.length() > 0){
             //BridgeSerial.println(String("Line: ") + line);
-            if(line.startsWith("IDN")){
+            if(line.startsWith("NULL")){
+                /// do nothing, the reader encountered an issue so we'll just continue on
+            } else if(line.startsWith("IDN")){
                 serialSend(CMD_INFO, 0);
             } else if(line.startsWith("RDA0")){
                 debug = false;
@@ -223,17 +226,6 @@ void DemoTask(void *pvParameters){
         vTaskDelay(500 / portTICK_PERIOD_MS);
     }
 }
-
-// Stuff the arduino environment needs to do in order to keep running
-// for stm32 at least the serialEvents need to be run often, so let's just run this at a very high priority
-// for now. Mostly it's just handling the serial FIFOs.
-void ArduinoTask(void *pvParameters){
-    while(1){
-        if(serialEventRun) serialEventRun();
-        vTaskDelay(1);
-    }
-}
-
 
 QueueHandle_t debugQueue = NULL; 
 void debugSend(char msg){
@@ -262,6 +254,7 @@ void DebugTask(void *pvParameters){
     }
 }
 
+// This never worked on STM32FreeRTOS, needs some extra config and I'm too lazy for that
 void StatsTask(void *pvParameters){
     char buf[200];
     while(1){
@@ -271,22 +264,6 @@ void StatsTask(void *pvParameters){
     }
 }
 
-byte hexToInt(byte h[2]){
-    signed int r = 0;
-    for(int i = 0; i < 2; i++){
-        if(h[i] >= '0' && h[i] <= '9'){
-            r += h[i] - '0';
-        } else if(h[i] >= 'a' && h[i] <= 'f'){
-            r += h[i] - 'a' + 10;
-        } else if(h[i] >= 'A' && h[i] <= 'F'){
-            r += h[i] - 'A' + 10;
-        } else {
-            return -1;
-        }
-        r += 16; // binary math stuff
-    }
-    return r;
-}
 void setup(){
     while(!BridgeSerial);
     BridgeSerial.begin(115200);
@@ -296,9 +273,6 @@ void setup(){
     assert((keyboardQueue = xQueueCreate(32, sizeof(char))) != NULL);
     assert((serialQueue = xQueueCreate(10, sizeof(serial_msg_t))) != NULL);
     assert((debugQueue  = xQueueCreate(16, sizeof(char))) != NULL);
-    //xTaskCreate(ArduinoTask, "arduino_services",
-    //    1024, NULL,
-    //    tskIDLE_PRIORITY+6, NULL);
     xTaskCreate(BlinkTask, "blink", 
         128, NULL, 
         tskIDLE_PRIORITY, NULL);
@@ -308,15 +282,12 @@ void setup(){
     xTaskCreate(SerialRXTask, "serial_rx",
         1024, NULL,
         tskIDLE_PRIORITY+1, NULL);
-    //xTaskCreate(KeyboardTask, "keyboard",
-    //    1024, NULL,
-    //    tskIDLE_PRIORITY, NULL);
+    xTaskCreate(KeyboardTask, "keyboard",
+        1024, NULL,
+        tskIDLE_PRIORITY, NULL);
     xTaskCreate(DebugTask, "debug_output", 
         1024, NULL,
         tskIDLE_PRIORITY+1, NULL);
-    //xTaskCreate(StatsTask, "stats",
-    //    512, NULL,
-    //    tskIDLE_PRIORITY+2, NULL);
     //xTaskCreate(DemoTask, "demo",
     //    256, NULL,
     //    tskIDLE_PRIORITY+1, NULL);
