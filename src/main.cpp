@@ -3,14 +3,26 @@
 // configuration
 #if defined(ARDUINO_ARCH_STM32)
 #   include <STM32FreeRTOS.h>
-#   define PS2_CLK PB3
-#   define PS2_DATA PB4
-    //HardwareSerial BridgeSerial(PA10, PA9);
-    auto BridgeSerial = Serial;
+#   if defined(ARDUINO_NUCLEO_F411RE)
+#       define PS2_CLK PB3
+#       define PS2_DATA PB4
+#       define LED_DATA PB0
+#       define LED_CLK PC0
+#       define LED_CS PC1
+        auto BridgeSerial = Serial; 
+#   elif defined(ARDUINO_BLACKPILL_F411CE)
+#       define PS2_CLK PB9
+#       define PS2_DATA PB8
+        HardwareSerial BridgeSerial(PA10, PA9);
+#   endif
+    
 #elif defined(ARDUINO_ARCH_AVR)
 #   include <Arduino_FreeRTOS.h>
 #   define PS2_CLK 3
 #   define PS2_DATA 2
+#   define LED_DATA 4
+#   define LED_CLK 5
+#   define LED_CS 6
     auto BridgeSerial = Serial;
 #else
 #   error Unknown architecture!
@@ -18,7 +30,8 @@
 #include <queue.h>
 #include <assert.h>
 
-#include <String.h>
+//#include <String.h>
+#include <vector>
 #include <ps2dev.h>
 #include <LedController.hpp>
 
@@ -27,6 +40,7 @@ typedef enum {
     CMD_INFO,
     CMD_DEBUG,
     CMD_OK,
+    CMD_KEYBOARD,
     CMD_LEDS
 } cmd_t;
 typedef struct {
@@ -55,19 +69,43 @@ QueueHandle_t keyboardQueue;
 void keyboardSend(char c){
     assert((xQueueSend(keyboardQueue, &c, portMAX_DELAY)) != pdFAIL);
 }
+int keyboard_write(unsigned char d){
+    //taskENTER_CRITICAL();
+    int r = keyboard.write(d);
+    //taskEXIT_CRITICAL();
+    return r;
+}
+int keyboard_handle(unsigned char *leds){
+    //taskENTER_CRITICAL();
+    int r = keyboard.keyboard_handle(leds);
+    //taskEXIT_CRITICAL();
+    return r;
+}
 void KeyboardTask(void *pvParameters){
-    keyboard.keyboard_init();
-
     while(1){
-        unsigned char leds;
-        if(keyboard.keyboard_handle(&leds) != 0){
-            serialSend(CMD_LEDS, leds);
+        while(keyboard_write(0xA0) != 0){
+            serialSend(CMD_KEYBOARD, 0);
+            vTaskDelay(10 / portTICK_PERIOD_MS);
         }
-        char keyboardData;
-        while(xQueueReceive(keyboardQueue, &keyboardData, 0) == pdPASS){
-            keyboard.write(keyboardData);
-        }
-        vTaskDelay(10/portTICK_PERIOD_MS);
+        serialSend(CMD_KEYBOARD, 1);
+
+        int idle = 0;
+        const int timeout = 10000; // approximately 10 seconds
+        do {
+
+            unsigned char leds;
+            if(keyboard_handle(&leds) != 0){
+                serialSend(CMD_LEDS, leds);
+            }
+            char keyboardData;
+            while(xQueueReceive(keyboardQueue, &keyboardData, 1) == pdPASS){
+                serialSend(CMD_KEYBOARD, 2);
+                keyboard_write(keyboardData);
+                idle = 0;
+            }
+            idle++;
+            vTaskDelay(1/portTICK_PERIOD_MS);
+        } while(idle < timeout);
     }
 }
 
@@ -96,7 +134,11 @@ void SerialTXTask(void *pvParameters){
                     }
                     break;
                 case CMD_INFO:
-                    BridgeSerial.println("PS2 Keyboard emulator and reader");
+                    if(serialMessage.data == 0){
+                        BridgeSerial.println("PS2 Keyboard emulator and reader");
+                    } else {
+                        BridgeSerial.println("PS2 Keyboard Emulator - DEBUG MODE");
+                    }
                     break;
                 case CMD_LEDS:
                     BridgeSerial.println("LEDS" + String((int)serialMessage.data, HEX));
@@ -107,6 +149,17 @@ void SerialTXTask(void *pvParameters){
                 case CMD_OK:
                     //BridgeSerial.println("OK" + String((int)serialMessage.data, DEC));
                     BridgeSerial.println("OK");
+                    break;
+                case CMD_KEYBOARD:
+                    /*
+                    if(serialMessage.data == 0){
+                        BridgeSerial.println("Keyboard disconnected, attempting connect!");
+                    } else if(serialMessage.data == 1){
+                        BridgeSerial.println("Keyboard connected!");
+                    } else if(serialMessage.data == 2){
+                        BridgeSerial.println("Sending keycode");
+                    }
+                    // */
                     break;
                 default:
                     BridgeSerial.println("Unknown Command: " + String((int)serialMessage.cmd));
@@ -170,37 +223,45 @@ int keyboardHexParse(String &s, bool debug){
         }
         return sent;
 }
-String readLine(char terminator){
+String readLine(std::vector<char> terminators){
     String line;
     char c = (char)NULL;
     int length = 0;
 
+    bool terminate = false;
     do {
-        while(BridgeSerial.available()){
+        while(BridgeSerial.available() && !terminate){
             c = BridgeSerial.read();
+            //BridgeSerial.println("Received: " + String((int)c, HEX)); // for when dealing with a terminal program that doesn't work as expected
             line += String((char)c);
             length++;
             if(length >= 34){
                 serialSend(CMD_ERROR, 1);
                 return String("NULL");
             }
+
+            for(char terminator : terminators){
+                if(c == terminator){
+                    terminate = true;
+                }
+            }
         }
         vTaskDelay(10 / portTICK_PERIOD_MS);
-    } while(c != terminator);
+    } while(!terminate);
     return line;
 }
 void SerialRXTask(void *pvParameters){
     bool debug = false;
     while(1){
         //String line = BridgeSerial.readStringUntil('\n'); // this is very CPU heavy and needs some vTaskDelays to not just sit there chewing the whole cpu up with nothing happening
-        String line = readLine('\n');
+        String line = readLine({'\r', '\n'});
         line.trim(); // remove excess whitespace
         if(line.length() > 0){
             //BridgeSerial.println(String("Line: ") + line);
             if(line.startsWith("NULL")){
                 /// do nothing, the reader encountered an issue so we'll just continue on
             } else if(line.startsWith("IDN")){
-                serialSend(CMD_INFO, 0);
+                serialSend(CMD_INFO, (int)debug);
             } else if(line.startsWith("RDA0")){
                 debug = false;
             } else if(line.startsWith("RDA1")){
@@ -235,11 +296,13 @@ char toHex(int i){
     String s = String(i, HEX);
     return s.c_str()[0];
 }
+
+#ifdef USE_DEBUG_LED
 void DebugTask(void *pvParameters){
     LedController led(
-        PB0, // Data
-        PC0, // Clk
-        PC1, // Load/CS
+        LED_DATA, // Data
+        LED_CLK, // Clk
+        LED_CS, // Load/CS
         1 // Number of MAX7219 Devices
     );
     led.activateAllSegments();
@@ -253,6 +316,11 @@ void DebugTask(void *pvParameters){
         }
     }
 }
+#else
+void DebugTask(void *pvParameters){
+    vTaskSuspend(NULL); // just stop this task from running
+}
+#endif
 
 // This never worked on STM32FreeRTOS, needs some extra config and I'm too lazy for that
 void StatsTask(void *pvParameters){
@@ -260,7 +328,7 @@ void StatsTask(void *pvParameters){
     while(1){
         //vTaskList((char *)&buf);
         //Serial.println(buf);
-        vTaskDelay(1000 * portTICK_RATE_MS);
+        vTaskDelay(1000 * portTICK_PERIOD_MS);
     }
 }
 
@@ -270,12 +338,15 @@ void setup(){
     //BridgeSerial.setTimeout(10000); // is 10 seconds sane for now?
     BridgeSerial.println("Initialising");
 
+    pinMode(PS2_CLK, INPUT_PULLUP);
+    pinMode(PS2_DATA, INPUT_PULLUP);
+
     assert((keyboardQueue = xQueueCreate(32, sizeof(char))) != NULL);
     assert((serialQueue = xQueueCreate(10, sizeof(serial_msg_t))) != NULL);
     assert((debugQueue  = xQueueCreate(16, sizeof(char))) != NULL);
     xTaskCreate(BlinkTask, "blink", 
         128, NULL, 
-        tskIDLE_PRIORITY, NULL);
+        tskIDLE_PRIORITY+1, NULL);
     xTaskCreate(SerialTXTask, "serial_tx",
         1024, NULL,
         tskIDLE_PRIORITY+2, NULL);
@@ -284,7 +355,7 @@ void setup(){
         tskIDLE_PRIORITY+1, NULL);
     xTaskCreate(KeyboardTask, "keyboard",
         1024, NULL,
-        tskIDLE_PRIORITY, NULL);
+        tskIDLE_PRIORITY+2, NULL);
     xTaskCreate(DebugTask, "debug_output", 
         1024, NULL,
         tskIDLE_PRIORITY+1, NULL);
